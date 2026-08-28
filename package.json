@@ -119,6 +119,13 @@
                     "default": false,
                     "description": "Toggles the display of GPU memory in use. macOS only; automatically hidden on machines that do not report GPU statistics."
                 },
+                "systemvitals.gpu.sampleintervalms": {
+                    "type": "number",
+                    "default": 250,
+                    "minimum": 50,
+                    "maximum": 2000,
+                    "description": "How often, in ms, GPU utilization is read while the GPU reading is on screen. macOS reports utilization as a span between reads rather than as a level, so readings taken far apart run high: lowering this makes the percentage more accurate and costs more CPU, raising it does the reverse. Each read costs roughly 9ms of CPU."
+                },
                 "systemvitals.gpu.unit": {
                     "type": "string",
                     "enum": [

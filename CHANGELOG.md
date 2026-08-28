@@ -1,5 +1,16 @@
 # Change Log
 
+## [Unreleased]
+
+Both GPU readings were wrong on Apple Silicon. Neither was wrong in a way that looked broken, which is why they lasted: one was a plausible number that meant something else, and the other pinned high.
+
+- **GPU utilization was effectively a yes/no answer.** macOS reports `Device Utilization %` as a span between reads, not as a level: it covers the time since the statistic was last read, and its denominator discounts time the GPU had nothing queued. Read once per update, as it was, a load busy exactly half the time reported 88% on a 3-second interval and would approach 100% on the 10-second default. Utilization is now sampled in the background at a fixed brisk cadence and averaged over the interval, which is the only way the figure means what the CPU percentage beside it means. The same load now reports 78% at the default cadence and 60% at 100 ms, against a true 47%; a steady load and an idle GPU were and remain exact. New `systemvitals.gpu.sampleintervalms` (50-2000 ms, default 250) trades CPU for accuracy — each read costs about 9 ms of CPU, so the default spends roughly 3.5% of one core while the reading is on screen. Polling relaxes while the GPU is idle and stops when the reading is hidden.
+- **GPU memory led with a figure that does not track GPU memory.** The status bar showed `In use system memory / Alloc system memory`, which reads as used-out-of-total but is neither. Holding 6 GB on the GPU moved the first figure by −0.07 GB while the second tracked it exactly. The reading now shows the allocation — the figure that responds to real allocations — against total system memory, which on unified memory is the pool it is genuinely drawn from. `In use system memory` is kept in the hover as "Mapped now", named for what it is. A discrete GPU, whose VRAM the registry does not report, shows the allocation with no total rather than a made-up one.
+- A Mac listing an accelerator that reports no utilization ahead of one that does showed no GPU section at all: the parser stopped at the first set of statistics it found and gave up if that one lacked utilization. It now scans past such accelerators.
+- The accelerator's name and core count are now read from the node that supplied the statistics only, so a neighbouring accelerator listed after it can no longer lend its name to another one's numbers.
+- `ioreg` is invoked by absolute path, so a GUI-launched VS Code with an unusual `PATH` cannot silently lose the whole GPU section.
+- The GPU hover gains a peak figure alongside the average, since an average over the interval hides whether the GPU was ever pegged.
+
 ## [2.0.0]
 
 Three things change without being asked to, which is what the major version is for. No setting was removed or renamed, so existing configuration carries over untouched.

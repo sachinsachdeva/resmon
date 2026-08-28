@@ -352,6 +352,11 @@ abstract class AppleGpuResource extends Resource {
     }
 
     protected async isShown(): Promise<boolean> {
+        // Applied here because a WorkspaceConfiguration is a snapshot, so the
+        // sampler has to be told again on every tick or it would keep the
+        // cadence it was given at activation.
+        this._sampler.setPollInterval(this._config.get('gpu.sampleintervalms', 250));
+
         // The sampler caches briefly, so this read and the one in render()
         // share a single ioreg invocation.
         let stats = await this._sampler.sample();
@@ -374,6 +379,13 @@ class GpuUsage extends AppleGpuResource {
         return {
             text: `$(circuit-board) ${(stats.utilization).toFixed(this.getPrecision())}%`,
             rows: this.getRows(stats),
+            // The figure is an average of many brisk readings rather than one
+            // reading per update, because macOS reports GPU utilization as a
+            // span between reads and reads taken far apart run high.
+            note: stats.sampleCount > 1
+                ? undefined
+                : "This update caught only one reading, so the figure runs high. Raising the update "
+                    + "interval, or lowering systemvitals.gpu.sampleintervalms, gathers more of them.",
         };
     }
 
@@ -381,11 +393,22 @@ class GpuUsage extends AppleGpuResource {
         let rows: DetailRow[] = [];
 
         if (stats.model !== null) {
-            let cores = stats.coreCount === null ? "" : ` · ${stats.coreCount} cores`;
+            let cores = stats.coreCount === null ? "" : ` \u00b7 ${stats.coreCount} cores`;
             rows.push({ label: "Graphics", value: `${stats.model}${cores}` });
         }
 
         rows.push({ label: "Utilization", value: this.formatPercent(stats.utilization) });
+
+        // The mean is what belongs in the status bar, but it hides the thing
+        // people are usually looking for: whether the GPU was ever pegged.
+        // A single reading is its own peak, so the row would say nothing.
+        if (stats.sampleCount > 1) {
+            rows.push({
+                label: "Peak",
+                value: `${this.formatPercent(stats.peakUtilization)} (of ${stats.sampleCount} samples)`,
+            });
+        }
+
         return rows;
     }
 }
@@ -403,23 +426,55 @@ class GpuMemory extends AppleGpuResource {
         }
 
         let unit = this._config.get('gpu.unit', "GB");
-        var memDivisor = MemMappings[unit];
-        // Apple Silicon shares system memory with the CPU, so this is memory
-        // currently mapped out of memory the driver has claimed, not VRAM.
-        let inUseWithUnits = stats.inUseMemory / memDivisor;
-        let allocatedWithUnits = stats.allocatedMemory / memDivisor;
 
         return {
-            text: `$(server) ${(inUseWithUnits).toFixed(this.getPrecision())}/${(allocatedWithUnits).toFixed(this.getPrecision())} ${unit}`,
-            rows: [
-                { label: "Memory in use", value: this.formatWithUnit(stats.inUseMemory, unit) },
-                { label: "Driver allocation", value: this.formatWithUnit(stats.allocatedMemory, unit) },
-            ],
-            // The one figure here people reliably misread, and the status bar
-            // has no room to say so.
-            note: "The GPU shares one pool of memory with the CPU. The allocation is what the driver "
-                + "has claimed from the system so far, not a fixed VRAM capacity, so it moves over time.",
+            text: `$(server) ${this.formatUsage(stats, unit)}`,
+            rows: this.getRows(stats, unit),
+            note: stats.totalMemory === null
+                ? undefined
+                // The one figure here people reliably misread, and the status
+                // bar has no room to say so.
+                : "The GPU has no memory of its own: it draws from the same pool as the CPU, so this "
+                    + "is its share of total system memory rather than a separate pile of VRAM.",
         };
+    }
+
+    /**
+     * The status bar figure: what the GPU is using, out of the pool it draws
+     * from where there is one to name.
+     *
+     * The allocation is the figure that tracks GPU memory. Its sibling "In use
+     * system memory" counts only what is mapped at this instant, which on
+     * Apple Silicon barely moves: claiming several gigabytes on the GPU leaves
+     * it unchanged, so leading with it made the reading look stuck.
+     */
+    private formatUsage(stats: GpuStats, unit: string): string {
+        let used = (stats.allocatedMemory / MemMappings[unit]).toFixed(this.getPrecision());
+        if (stats.totalMemory === null) {
+            return `${used} ${unit}`;
+        }
+
+        let total = (stats.totalMemory / MemMappings[unit]).toFixed(this.getPrecision());
+        return `${used}/${total} ${unit}`;
+    }
+
+    private getRows(stats: GpuStats, unit: string): DetailRow[] {
+        let rows: DetailRow[] = [
+            { label: "In use", value: this.formatWithUnit(stats.allocatedMemory, unit) },
+        ];
+
+        if (stats.totalMemory !== null) {
+            rows.push({
+                label: "Shared pool",
+                value: `${this.formatWithUnit(stats.totalMemory, unit)} total, `
+                    + `${this.formatPercent(stats.allocatedMemory / stats.totalMemory * 100)} to the GPU`,
+            });
+        }
+
+        // Kept, but demoted and named for what it is, because it is the figure
+        // that does not answer "how much memory is the GPU using".
+        rows.push({ label: "Mapped now", value: this.formatWithUnit(stats.mappedMemory, unit) });
+        return rows;
     }
 }
 
@@ -743,6 +798,7 @@ class ResMon {
     // nobody has asked for.
     private _details: DetailsView;
     private _snapshots: PanelSection[];
+    private _gpuSampler: AppleGpuSampler;
 
     constructor(extensionFilter: string) {
         this._config = workspace.getConfiguration('systemvitals');
@@ -754,6 +810,7 @@ class ResMon {
         // The GPU resources share one sampler so that a tick costs a single
         // read of the IOKit registry rather than one per resource.
         let gpuSampler = new AppleGpuSampler();
+        this._gpuSampler = gpuSampler;
 
         // Add all resources to monitor. Resources sharing a section are kept
         // together, since a section is one entry in the status bar.
@@ -909,6 +966,7 @@ class ResMon {
         this._commandListeners.forEach(listener => listener.dispose());
         this._sections.forEach(section => section.dispose());
         this._details.dispose();
+        this._gpuSampler.dispose();
     }
 }
 
