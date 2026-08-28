@@ -47,6 +47,7 @@ None beyond VS Code 1.74 or newer. The `systeminformation` module is bundled wit
 - `systemvitals.show.gpu`: Show GPU utilization. macOS only; see GPU Monitoring below.
 - `systemvitals.show.gpumem`: Show GPU memory in use. macOS only; see GPU Monitoring below.
 - `systemvitals.gpu.unit`: Unit used for GPU memory (GB-B).
+- `systemvitals.gpu.sampleintervalms`: How often GPU utilization is read while the reading is on screen (50-2000 ms, default 250). See GPU Monitoring below for why this exists.
 - `systemvitals.disk.format`: Configures how the disk space is displayed (percentage remaining/used, absolute remaining, used out of totel).
 - `systemvitals.disk.drives`: Drives to show, by mount point or device name. For example, `C:` on Windows, `/home` or `/dev/sda1` on Linux. Leave empty to pick sensible volumes automatically; see Disk Space below.
 - `systemvitals.updatefrequencyms`: How frequently to query systeminformation, 10 seconds by default. This governs the hover details as well as the status bar; see Hovering for Detail below for why the default is unhurried. The minimum is 200 ms as to prevent accidentally updating so fast as to freeze up your machine.
@@ -94,8 +95,20 @@ VS Code redraws an open hover the instant its content changes, so details rebuil
 
 GPU statistics are **macOS only**, and work on Apple Silicon (M-series) as well as Intel Macs. They are read from the IOKit registry with `ioreg`, which requires no elevated privileges — unlike `powermetrics`, which needs `sudo`. On any machine that does not report GPU statistics, both GPU metrics hide themselves automatically rather than showing an error.
 
-- `systemvitals.show.gpu` displays GPU utilization as a percentage. This is the driver's instantaneous `Device Utilization %`, sampled at each update rather than averaged over the interval, so expect it to fluctuate the same way CPU usage does.
-- `systemvitals.show.gpumem` displays GPU memory as *in use / allocated*. Note that this is **not** used-out-of-VRAM: Apple Silicon uses unified memory with no fixed GPU partition, so the second figure is how much system memory the GPU driver has currently claimed, not a fixed capacity. It moves over time.
+- `systemvitals.show.gpu` displays GPU utilization as a percentage, averaged over the update interval.
+
+  macOS reports utilization as `Device Utilization %`, which is not a level but a **span between reads**: it describes the time since the statistic was last read, and its denominator discounts time the GPU had nothing queued. Read once per update it therefore answers "did the GPU do anything since you last looked", pinning near 100% whenever the answer is yes. Measured on an M4 against a load busy exactly half the time:
+
+  | Read every | Reports |
+  |:---|:---|
+  | 10 ms | 47% (the true duty cycle) |
+  | 100 ms | 61% |
+  | 300 ms | 80% |
+  | 500 ms | 93% |
+
+  So the reading is sampled in the background and averaged, rather than read once per update. `systemvitals.gpu.sampleintervalms` is that cadence, and it is a direct trade of CPU for accuracy: each read costs about 9 ms of CPU, so the 250 ms default spends roughly 3.5% of one core while the reading is on screen. Lower it for a more faithful percentage on bursty workloads, raise it to spend less. Polling relaxes automatically while the GPU is idle, and stops entirely when the reading is hidden or switched off. A steady load and an idle GPU are reported accurately at any cadence; only intermittent work is sensitive to it.
+
+- `systemvitals.show.gpumem` displays GPU memory as *in use / total*. On Apple Silicon this is the driver's `Alloc system memory` — the memory the GPU has actually claimed, which tracks real allocations exactly — against total system memory. It is **not** used-out-of-VRAM: unified memory means there is no fixed GPU partition, so the total is the shared pool the GPU draws from rather than a dedicated capacity. On a Mac with a discrete GPU, whose VRAM the registry does not report, the allocation is shown on its own with no total. The hover additionally reports "Mapped now" (`In use system memory`), which counts only what is mapped at that instant and moves independently of what the GPU has allocated.
 
 GPU frequency and GPU power are not available, as both require `sudo powermetrics` or private APIs.
 
