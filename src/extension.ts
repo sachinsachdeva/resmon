@@ -352,15 +352,21 @@ abstract class AppleGpuResource extends Resource {
     }
 
     protected async isShown(): Promise<boolean> {
+        // Asked first, so a reading the user has switched off costs nothing at
+        // all. Sampling before this check meant a disabled GPU reading still
+        // ran the full burst every update.
+        if (!await super.isShown()) {
+            return false;
+        }
+
         // Applied here because a WorkspaceConfiguration is a snapshot, so the
         // sampler has to be told again on every tick or it would keep the
-        // cadence it was given at activation.
-        this._sampler.setPollInterval(this._config.get('gpu.sampleintervalms', 250));
+        // interval it was given at activation.
+        this._sampler.setUpdateInterval(this._config.get('updatefrequencyms', DEFAULT_UPDATE_FREQUENCY_MS));
 
-        // The sampler caches briefly, so this read and the one in render()
-        // share a single ioreg invocation.
-        let stats = await this._sampler.sample();
-        return stats !== null && await super.isShown();
+        // The sampler caches briefly, so this and the one in render() share a
+        // single burst.
+        return await this._sampler.sample() !== null;
     }
 }
 
@@ -379,13 +385,13 @@ class GpuUsage extends AppleGpuResource {
         return {
             text: `$(circuit-board) ${(stats.utilization).toFixed(this.getPrecision())}%`,
             rows: this.getRows(stats),
-            // The figure is an average of many brisk readings rather than one
-            // reading per update, because macOS reports GPU utilization as a
-            // span between reads and reads taken far apart run high.
+            // The figure is an average of a short burst of closely spaced
+            // readings, because macOS reports GPU utilization as a span
+            // between reads and reads taken far apart run high.
             note: stats.sampleCount > 1
                 ? undefined
-                : "This update caught only one reading, so the figure runs high. Raising the update "
-                    + "interval, or lowering systemvitals.gpu.sampleintervalms, gathers more of them.",
+                : "This update caught only one reading, so the figure runs high. A longer "
+                    + "systemvitals.updatefrequencyms allows a fuller burst.",
         };
     }
 
