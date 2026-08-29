@@ -3,7 +3,10 @@ import { test } from 'node:test';
 import { Volume, selectVolumes, volumeLabel } from '../disk';
 
 function volume(fs: string, mount: string, use: number, size: number = 245107195904): Volume {
-    return { fs: fs, mount: mount, size: size, used: Math.round(size * use / 100), use: use };
+    // On APFS every volume in the container reports the container's size, so
+    // "available" is the shared remainder rather than size minus used.
+    let used = Math.round(size * use / 100);
+    return { fs: fs, mount: mount, size: size, used: used, available: size - used, use: use };
 }
 
 // The eight APFS volumes a real Apple M4 reports for one physical disk.
