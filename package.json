@@ -2,7 +2,7 @@
     "name": "system-vitals",
     "displayName": "System Vitals",
     "description": "CPU, GPU, memory, disk and battery monitoring in the VS Code status bar, with native Apple Silicon GPU support.",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "publisher": "SachinSachdeva",
     "license": "SEE LICENSE IN LICENSE.md",
     "engines": {

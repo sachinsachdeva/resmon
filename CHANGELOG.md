@@ -1,6 +1,6 @@
 # Change Log
 
-## [Unreleased]
+## [2.1.0]
 
 Both GPU readings were wrong on Apple Silicon. Neither was wrong in a way that looked broken, which is why they lasted: one was a plausible number that meant something else, and the other pinned high.
 
@@ -16,6 +16,12 @@ Both GPU readings were wrong on Apple Silicon. Neither was wrong in a way that l
 - `ioreg` is invoked by absolute path, so a GUI-launched VS Code with an unusual `PATH` cannot silently lose the whole GPU section.
 - The GPU hover gains a peak figure alongside the average, since an average hides whether the GPU was ever pegged. The peak is the burst's own and is not eased, so "is it busy right now" is answerable on the first update.
 - A GPU reading that is switched off now costs nothing. `isShown()` sampled before asking whether the reading was wanted, so the statistics were gathered every update even when both GPU metrics were disabled.
+
+The dependencies were overhauled at the same time, which changes what the disk figures mean.
+
+- **Disk space is now reported the way `df` reports it, and the old numbers were wrong.** The percentage is used over used-plus-available, where it was used over size, and free space comes from the volume's own available figure rather than size minus used. On APFS those differ sharply, because every volume in a container reports the whole container as its size: this machine was shown as having 37 GB free where `df` said 9.9 GB, and 16% used where `df` said 96%. Expect the numbers to move, sometimes a long way; they were previously optimistic.
+- `systeminformation` was upgraded from 4.x to 5.x. It is the only dependency that ships, and every release up to 5.31.6 carried command injection advisories -- eleven of them. Together with patches to the development dependencies, `npm audit` goes from eight vulnerabilities, one of them critical, to none.
+- CPU temperature is correctly absent on a machine with no readable sensor, rather than reading "null C". systeminformation 5 reports no sensor as null where 4 reported -1, and the check knew only about -1.
 
 ## [2.0.0]
 
