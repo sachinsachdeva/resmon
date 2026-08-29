@@ -47,7 +47,6 @@ None beyond VS Code 1.74 or newer. The `systeminformation` module is bundled wit
 - `systemvitals.show.gpu`: Show GPU utilization. macOS only; see GPU Monitoring below.
 - `systemvitals.show.gpumem`: Show GPU memory in use. macOS only; see GPU Monitoring below.
 - `systemvitals.gpu.unit`: Unit used for GPU memory (GB-B).
-- `systemvitals.gpu.sampleintervalms`: How often GPU utilization is read while the reading is on screen (50-2000 ms, default 250). See GPU Monitoring below for why this exists.
 - `systemvitals.disk.format`: Configures how the disk space is displayed (percentage remaining/used, absolute remaining, used out of totel).
 - `systemvitals.disk.drives`: Drives to show, by mount point or device name. For example, `C:` on Windows, `/home` or `/dev/sda1` on Linux. Leave empty to pick sensible volumes automatically; see Disk Space below.
 - `systemvitals.updatefrequencyms`: How frequently to query systeminformation, 10 seconds by default. This governs the hover details as well as the status bar; see Hovering for Detail below for why the default is unhurried. The minimum is 200 ms as to prevent accidentally updating so fast as to freeze up your machine.
@@ -95,29 +94,21 @@ VS Code redraws an open hover the instant its content changes, so details rebuil
 
 GPU statistics are **macOS only**, and work on Apple Silicon (M-series) as well as Intel Macs. They are read from the IOKit registry with `ioreg`, which requires no elevated privileges — unlike `powermetrics`, which needs `sudo`. On any machine that does not report GPU statistics, both GPU metrics hide themselves automatically rather than showing an error.
 
-- `systemvitals.show.gpu` displays GPU utilization as a percentage, averaged over the update interval.
+- `systemvitals.show.gpu` displays GPU utilization as a percentage.
 
-  macOS reports utilization as `Device Utilization %`, which is not a level but a **span between reads**: it describes the time since the statistic was last read, and its denominator discounts time the GPU had nothing queued. Read once per update it therefore answers "did the GPU do anything since you last looked", pinning near 100% whenever the answer is yes. Measured on an M4 against a load busy exactly half the time:
+  macOS reports utilization as `Device Utilization %`, which is not a level but a **span between reads**: it describes the time since the statistic was last read, and its denominator discounts time the GPU had nothing queued. Read once per update it therefore answers "did the GPU do anything since you last looked", pinning near 100% whenever the answer is yes. Measured on an M4 against a load busy exactly half the time, the width of that span is what decides the answer:
 
-  | Read every | Reports |
+  | Span between reads | Reports |
   |:---|:---|
-  | 10 ms | 47% (the true duty cycle) |
+  | 50 ms | ~50% (the true duty cycle) |
   | 100 ms | 61% |
   | 300 ms | 80% |
   | 500 ms | 93% |
+  | once per update | 88-100% |
 
-  So the reading is sampled in the background and averaged, rather than read once per update. `systemvitals.gpu.sampleintervalms` is that cadence, and it is a direct trade of CPU for accuracy. A read costs about 28 ms of CPU when made periodically — considerably more than the 9 ms it costs back to back, because a spawn this far apart re-faults and re-links rather than running warm:
+  So each update takes a short **burst** of readings 50 ms apart and averages them, having first taken one reading to re-base the statistic. What matters is the spacing *within* the burst, not how much of the interval is covered — which is why this is both more accurate and far cheaper than polling continuously between updates. Successive bursts are eased together, because a burst is unbiased but samples only a fraction of a second and would otherwise make the reading jump.
 
-  | Cadence | Reports | CPU while busy |
-  |:---|:---|:---|
-  | 100 ms | 60% | ~22% of one core |
-  | 250 ms (default) | 78% | ~10% of one core |
-  | 500 ms | ~93% | ~5.5% of one core |
-  | 1000 ms | ~96% | ~3.3% of one core |
-
-  The accuracy cliff is steep and sits just below the default: at 500 ms and slower every cadence reports 87–96% for that load, which is no better than not averaging at all. Lower the setting for a more faithful percentage, raise it to spend less and accept a figure that runs high.
-
-  That cost is only paid while the GPU is working. After eight idle readings the poller drops to every 2 s — a measured 2% of one core — because an idle GPU reads zero however often it is asked, and it stops entirely when the reading is hidden or switched off. A steady load and an idle GPU are reported accurately at any cadence; only intermittent work is sensitive to it.
+  Nothing runs between updates. That is deliberate: every VS Code window runs its own extension host, so anything polling in the background multiplies by the number of open windows. Four windows cost about 6.9% of one core for the whole extension, against 29% for a background poller. A burst is also skipped entirely when the reading is switched off, and cut short as soon as it sees the GPU is idle.
 
 - `systemvitals.show.gpumem` displays GPU memory as *in use / total*. On Apple Silicon this is the driver's `Alloc system memory` — the memory the GPU has actually claimed, which tracks real allocations exactly — against total system memory. It is **not** used-out-of-VRAM: unified memory means there is no fixed GPU partition, so the total is the shared pool the GPU draws from rather than a dedicated capacity. On a Mac with a discrete GPU, whose VRAM the registry does not report, the allocation is shown on its own with no total. The hover additionally reports "Mapped now" (`In use system memory`), which counts only what is mapped at that instant and moves independently of what the GPU has allocated.
 

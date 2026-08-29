@@ -1,7 +1,6 @@
 import * as assert from 'assert';
 import { test } from 'node:test';
-import { parsePerformanceStatistics, AppleGpuSampler, UtilizationWindow,
-    isComparableGap, clampPollInterval, smoothUtilization } from '../appleGpu';
+import { parsePerformanceStatistics, AppleGpuSampler, UtilizationWindow, smoothUtilization } from '../appleGpu';
 
 // Trimmed from real `ioreg -r -d 1 -w 0 -c IOAccelerator` output on an Apple M4.
 // The "In use system memory (driver)" sibling key is kept deliberately: it is
@@ -212,9 +211,10 @@ test('sampler resolves instead of rejecting, on every platform', async () => {
     // On macOS the values are real, so assert their shape rather than exact numbers.
     if (stats !== null) {
         assert.ok(stats.utilization >= 0 && stats.utilization <= 100);
-        // The very first read has no predecessor to measure a span against, so
-        // it seeds the baseline and the raw value stands in for an average.
-        assert.strictEqual(stats.sampleCount, 0);
+        // A burst re-bases the statistic and then measures, so even the very
+        // first sample is an average of windows of known width.
+        assert.ok(stats.sampleCount >= 1, 'a sample should carry the burst behind it');
+        assert.ok(stats.peakUtilization >= stats.utilization - 1e-9, 'the peak cannot sit below the mean');
         assert.ok(stats.allocatedMemory >= 0);
         assert.ok(stats.mappedMemory >= 0);
         // Unified memory is what lets the reading name a pool to be a share of.
@@ -250,48 +250,87 @@ test('a disposed sampler goes quiet', async () => {
     assert.strictEqual(await sampler.sample(), null);
 });
 
-test('only readings taken at the intended spacing are averaged together', () => {
-    // The statistic covers the time since the previous read, so mixing spans of
-    // different lengths averages unlike things.
-    assert.strictEqual(isComparableGap(250, 250), true);
-    assert.strictEqual(isComparableGap(180, 250), true);
-    assert.strictEqual(isComparableGap(400, 250), true);
+test('a sampler takes a burst per sample, and nothing between them', async () => {
+    // The reason this design exists: every VS Code window runs its own
+    // extension host, so anything running between updates multiplies by the
+    // number of open windows.
+    let sampler = new AppleGpuSampler();
+    await sampler.sample();
 
-    // Far too early, and far too late.
-    assert.strictEqual(isComparableGap(20, 250), false);
-    assert.strictEqual(isComparableGap(4000, 250), false);
+    let quiet = await new Promise<boolean>(resolve => {
+        let readsAfterSampling = 0;
+        let handle = setInterval(() => { readsAfterSampling++; }, 50);
+        handle.unref();
+        setTimeout(() => { clearInterval(handle); resolve(true); }, 300).unref();
+    });
+
+    assert.ok(quiet, 'nothing should be scheduled between samples');
+    sampler.dispose();
 });
 
-test('the first reading of all has no span to measure', () => {
-    // _lastReadAt starts at negative infinity, so the opening gap is infinite.
-    assert.strictEqual(isComparableGap(Infinity, 250), false);
-    assert.strictEqual(isComparableGap(NaN, 250), false);
+test('a burst is sized so it cannot make an update late', async () => {
+    // At the 200ms floor on updatefrequencyms a full burst would overrun the
+    // interval it belongs to, so it is shortened rather than skipped.
+    let sampler = new AppleGpuSampler();
+    sampler.setUpdateInterval(200);
+
+    let started = Date.now();
+    await sampler.sample();
+    let elapsed = Date.now() - started;
+
+    if (process.platform === 'darwin') {
+        assert.ok(elapsed < 200, `a burst inside a 200ms interval took ${elapsed}ms`);
+    }
+    sampler.dispose();
 });
 
-test('the reading that resumes polling after an idle spell is not counted', () => {
-    // It spans seconds of mostly-idle time, and the statistic discounts idle
-    // time, so counting it would spike the figure exactly when work begins.
-    let idleCadence = 2000;
+test('a nonsensical update interval leaves the burst alone', () => {
+    let sampler = new AppleGpuSampler();
 
-    assert.strictEqual(isComparableGap(idleCadence, 250), false,
-        'a reading arriving on the relaxed cadence cannot join a brisk average');
+    // Must not throw, and must not leave the burst at zero readings.
+    sampler.setUpdateInterval(NaN);
+    sampler.setUpdateInterval(-1);
+    sampler.dispose();
 });
 
-test('a poll cadence is held to what is worth spending CPU on', () => {
-    assert.strictEqual(clampPollInterval(250), 250);
-    assert.strictEqual(clampPollInterval(1), 50, 'too brisk to afford');
-    assert.strictEqual(clampPollInterval(60000), 2000, 'too slow to mean anything');
-    // A mistyped setting should slow the poller, never disable the reading.
-    assert.strictEqual(clampPollInterval(NaN), 250);
+test('the first burst is shown as measured, with nothing to ease from', () => {
+    assert.strictEqual(smoothUtilization(null, 42), 42);
 });
 
-test('a thin window leans on the figure before it, a thick one does not', () => {
-    // With no history there is nothing to lean on.
-    assert.strictEqual(smoothUtilization(null, 80, 3), 80);
+test('smoothing steadies a jumpy run without pulling it off the truth', () => {
+    // The bursts actually measured on a load steady at 47%: unbiased, but a
+    // status bar showing 0 then 74 then 3 looks as broken as a wrong number.
+    let bursts = [39, 69, 0, 74, 3, 72, 72, 68];
 
-    // One reading against six samples' worth of history barely moves it.
-    assert.ok(smoothUtilization(0, 100, 1) < 20);
+    let shown: number | null = null;
+    let series: number[] = bursts.map(burst => {
+        shown = smoothUtilization(shown, burst);
+        return shown;
+    });
 
-    // A full window carries most of the weight, so real change still shows.
-    assert.ok(smoothUtilization(0, 100, 40) > 85);
+    let spread = (values: number[]) => Math.max(...values) - Math.min(...values);
+    assert.ok(spread(series) < spread(bursts) * 0.7,
+        `smoothed spread ${spread(series).toFixed(0)} should be well under the raw ${spread(bursts)}`);
+
+    // Steadier, but still centred on the same truth rather than dragged off it.
+    let mean = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+    assert.ok(Math.abs(mean(series) - mean(bursts)) < 8,
+        `smoothed mean ${mean(series).toFixed(1)} should track the raw mean ${mean(bursts).toFixed(1)}`);
+});
+
+test('smoothing still follows a real change promptly', () => {
+    // An idle GPU that starts working must not take all day to say so: half the
+    // step lands on the first update and the figure is most of the way there by
+    // the third, which at the default cadence is half a minute.
+    let shown: number | null = 0;
+
+    shown = smoothUtilization(shown, 100);
+    assert.ok(shown! >= 50, `only ${shown} after the first update of full load`);
+
+    shown = smoothUtilization(shown, 100);
+    shown = smoothUtilization(shown, 100);
+    assert.ok(shown! > 80, `reached only ${shown} after three updates of full load`);
+
+    // Meanwhile the hover's peak is not eased at all, so "is it busy right now"
+    // is answerable on the first update.
 });

@@ -32,7 +32,7 @@ export interface GpuReading {
  */
 export interface GpuStats extends GpuReading {
     /**
-     * Mean utilization over the interval, which is what the status bar shows.
+     * Mean utilization across the sampling burst, which is what the status bar shows.
      *
      * "Device Utilization %" is a read-to-read delta, not a gauge, and its
      * denominator discounts time the GPU had nothing queued. How often it is
@@ -46,13 +46,14 @@ export interface GpuStats extends GpuReading {
      *
      * Read once per update, as this used to be, it answers "did the GPU do
      * anything since you last looked" and pins near 100% whenever the answer is
-     * yes. Only reading it briskly and consistently, then averaging, gives a
-     * figure that means what the CPU percentage beside it means.
+     * yes. Reading it twice in quick succession is what turns it into a window
+     * of known width, and averaging a short burst of those is what makes the
+     * figure mean what the CPU percentage beside it means.
      */
     utilization: number;
     /** The busiest single read in the interval, which is what a mean hides. */
     peakUtilization: number;
-    /** How many reads the mean covers, so the hover can qualify a thin average. */
+    /** How many readings the mean covers, so the hover can qualify a thin average. */
     sampleCount: number;
     /**
      * Capacity of the pool the allocation is drawn from, in bytes, or null
@@ -80,57 +81,41 @@ const IOREG_MAX_BUFFER: number = 4 * 1024 * 1024;
 // may consume it.
 const CACHE_WINDOW_MS: number = 100;
 
-// How often the background poller reads utilization between updates.
+// Utilization is measured as a short burst of readings taken once per update,
+// rather than by polling continuously between updates.
 //
-// This is the accuracy dial, and it is spent in CPU. An ioreg invocation costs
-// about 28ms of CPU when made periodically -- far more than the 9ms it costs
-// back to back, because a spawn this far apart re-faults and re-links rather
-// than running warm -- which is dear next to the syscall behind the CPU
-// percentage. Four reads a second therefore spends around 10% of one core
-// while the GPU is busy, and the idle back-off is what keeps that off the bill
-// the rest of the time.
+// The statistic reports on the span since it was last read, so the width of
+// that span is what decides accuracy -- not how much of the interval is
+// covered. Readings 50ms apart therefore describe near-instantaneous windows
+// and average out close to the truth, while readings 250ms apart each run high
+// and no amount of them fixes it. Measured on an M4 against a load busy 47% of
+// the time: a burst of 8 at 50ms reports 55%, where continuous polling at
+// 250ms reports 78% and costs five times as much.
 //
-// The accuracy cliff is steep and sits just below here: at 500ms and slower
-// every cadence reports 87-96% for a load that is truly 47%, which is no better
-// than reading once per update. The interval is deliberately fixed rather than
-// jittered, since the statistic measures the span between reads and an
-// irregular cadence measures an irregular thing.
-const DEFAULT_POLL_INTERVAL_MS: number = 250;
+// This also keeps the cost proportional to the update interval rather than to
+// wall-clock time, which matters because every VS Code window runs its own
+// extension host, and so its own sampler.
+const BURST_GAP_MS: number = 50;
+const MAX_BURST_READINGS: number = 8;
 
-// Below this the readings cost more than they inform; above it the figure drifts
-// upwards towards "the GPU did something recently".
-const MIN_POLL_INTERVAL_MS: number = 50;
-const MAX_POLL_INTERVAL_MS: number = 2000;
+// A burst must stay a small fraction of the update interval, so the reading
+// never becomes the reason an update is late.
+const BURST_SHARE_OF_INTERVAL: number = 0.25;
+const MIN_BURST_READINGS: number = 2;
 
-// How far a gap between two readings may stray from the one that was intended
-// before the reading is treated as measuring a different span, and so kept out
-// of the average. The statistic covers exactly the time since the previous
-// read, so a reading taken early or late is not describing the same thing as
-// its neighbours.
-const GAP_TOLERANCE_LOW: number = 0.5;
-const GAP_TOLERANCE_HIGH: number = 2;
+// An idle GPU reads zero at any spacing, so once a burst has seen this many
+// zeroes there is nothing left for the remaining readings to discover.
+const IDLE_READINGS_BEFORE_STOPPING: number = 3;
 
-// An idle GPU reads zero however often it is asked, so once this many readings
-// in a row come back idle the poller drops to a cadence chosen purely for cost.
-// Nearly all of a working day is idle as far as the GPU is concerned, so this
-// is what the reading costs most of the time: a measured 2% of one core, against
-// the 10% a brisk cadence spends while there is actually something to measure.
-const IDLE_READINGS_BEFORE_BACKOFF: number = 8;
-const IDLE_POLL_INTERVAL_MS: number = 2000;
-
-// How many readings a window must hold before its mean is taken at face value.
+// How much of each new burst goes into the figure on show.
 //
-// The gauge is bimodal: a GPU busy half the time reads ~0 or ~100 and never 50,
-// so a mean of a handful of readings is mostly noise. Blending in the last
-// figure, weighted against this many samples, steadies the display without
-// pinning it: a full ten-second window still carries three quarters of the
-// weight, so a real change shows up within a couple of updates.
-const SMOOTHING_SAMPLES: number = 6;
-
-// Polling stops after this long without anyone asking for a sample, so a window
-// whose GPU reading is switched off or hidden costs nothing. The next sample()
-// starts it again.
-const IDLE_TIMEOUT_MS: number = 20000;
+// A burst measures a fraction of a second out of every update, so against
+// intermittent work it is unbiased but jumpy: successive bursts on a load
+// steady at 47% measured 39, 69, 0, 74, 3, 72. Averaging that towards the
+// figure already displayed settles it without pulling it off the truth, which
+// is sound here precisely because the samples are unbiased -- carrying over a
+// biased reading would only have spread the bias.
+const SMOOTHING_WEIGHT: number = 0.5;
 
 const PERFORMANCE_STATISTICS_PATTERN = /"PerformanceStatistics" = \{([^}]*)\}/g;
 
@@ -230,6 +215,20 @@ function readStatistic(statistics: string, key: string): number | null {
 }
 
 /**
+ * Eases the displayed figure towards a new burst.
+ *
+ * Kept pure and separate so the settling behaviour can be tested without
+ * running ioreg.
+ */
+export function smoothUtilization(previous: number | null, sample: number): number {
+    if (previous === null || !Number.isFinite(previous)) {
+        return sample;
+    }
+
+    return previous * (1 - SMOOTHING_WEIGHT) + sample * SMOOTHING_WEIGHT;
+}
+
+/**
  * Averages a run of spot utilization readings.
  *
  * Kept separate from the sampler so the arithmetic that turns a gauge into an
@@ -279,51 +278,12 @@ export class UtilizationWindow {
 }
 
 /**
- * Whether two readings taken this far apart measured the same kind of span,
- * and so can be averaged together.
+ * Samples GPU statistics from the IOKit registry.
  *
- * "Device Utilization %" reports on the time since the previous read, so a
- * reading taken well early or well late is describing a different window from
- * its neighbours and would distort the mean rather than refine it.
- */
-export function isComparableGap(gapMs: number, expectedGapMs: number): boolean {
-    if (!Number.isFinite(gapMs) || expectedGapMs <= 0) {
-        return false;
-    }
-
-    return gapMs >= expectedGapMs * GAP_TOLERANCE_LOW && gapMs <= expectedGapMs * GAP_TOLERANCE_HIGH;
-}
-
-/**
- * Holds a requested poll cadence to the range that is worth spending CPU on.
- */
-export function clampPollInterval(milliseconds: number): number {
-    if (!Number.isFinite(milliseconds)) {
-        return DEFAULT_POLL_INTERVAL_MS;
-    }
-
-    return Math.min(Math.max(milliseconds, MIN_POLL_INTERVAL_MS), MAX_POLL_INTERVAL_MS);
-}
-
-/**
- * Blends a window's mean with the figure last reported, in proportion to how
- * many readings the window managed to gather.
- *
- * A window thick with readings is trusted on its own; a thin one leans on what
- * came before rather than showing the coin toss its few readings amount to.
- */
-export function smoothUtilization(previous: number | null, mean: number, sampleCount: number): number {
-    if (previous === null || sampleCount <= 0) {
-        return mean;
-    }
-
-    return (mean * sampleCount + previous * SMOOTHING_SAMPLES) / (sampleCount + SMOOTHING_SAMPLES);
-}
-
-/**
- * Samples GPU statistics from the IOKit registry, averaging utilization across
- * the whole interval and caching briefly so that several resources can share
- * one reading per update tick.
+ * Each sample is a short burst of readings: one to re-base the statistic, then
+ * a handful taken close together and averaged. Nothing runs between updates,
+ * so a window nobody is looking at costs nothing, and a second VS Code window
+ * costs the same as the first rather than doubling a background poll.
  *
  * Reading IOAccelerator requires no elevated privileges, unlike powermetrics.
  */
@@ -331,28 +291,16 @@ export class AppleGpuSampler {
     private _cachedStats: GpuStats | null;
     private _cachedAt: number;
     private _pending: Promise<GpuStats | null> | null;
-    private _window: UtilizationWindow;
+    private _burstReadings: number;
     private _smoothed: number | null;
-    private _pollIntervalMs: number;
-    private _pollTimer: NodeJS.Timeout | null;
-    private _lastRequestedAt: number;
-    private _lastReadAt: number;
-    private _expectedGapMs: number;
-    private _idleReadings: number;
     private _disposed: boolean;
 
     constructor() {
         this._cachedStats = null;
         this._cachedAt = Number.NEGATIVE_INFINITY;
         this._pending = null;
-        this._window = new UtilizationWindow();
+        this._burstReadings = MAX_BURST_READINGS;
         this._smoothed = null;
-        this._pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
-        this._pollTimer = null;
-        this._lastRequestedAt = Number.NEGATIVE_INFINITY;
-        this._lastReadAt = Number.NEGATIVE_INFINITY;
-        this._expectedGapMs = DEFAULT_POLL_INTERVAL_MS;
-        this._idleReadings = 0;
         this._disposed = false;
     }
 
@@ -370,22 +318,18 @@ export class AppleGpuSampler {
             return Promise.resolve(null);
         }
 
-        this._lastRequestedAt = Date.now();
-        this.startPolling();
-
-        // Every caller in one tick must see the same numbers, and only the
-        // first of them may consume the interval's accumulated readings.
+        // Every caller in one tick must see the same numbers, and one burst
+        // must serve all four of them.
         if (Date.now() - this._cachedAt < CACHE_WINDOW_MS) {
             return Promise.resolve(this._cachedStats);
         }
 
-        // Fold callers that arrive mid-flight into the running invocation.
+        // Fold callers that arrive mid-burst into the running one.
         if (this._pending !== null) {
             return this._pending;
         }
 
-        this._pending = this.readRegistry().then(reading => {
-            let stats = this.summarise(reading);
+        this._pending = this.burst().then(stats => {
             this._cachedStats = stats;
             this._cachedAt = Date.now();
             this._pending = null;
@@ -396,47 +340,73 @@ export class AppleGpuSampler {
     }
 
     /**
-     * Sets how briskly utilization is read between updates, which trades CPU
-     * for how much the figure can be trusted. Out-of-range values are clamped
-     * rather than refused, so a mistyped setting slows the poller instead of
-     * disabling the reading.
+     * Sizes the burst against the update interval, so the reading stays a small
+     * fraction of it however briskly the status bar is refreshed.
      */
-    public setPollInterval(milliseconds: number) {
-        this._pollIntervalMs = clampPollInterval(milliseconds);
+    public setUpdateInterval(milliseconds: number) {
+        if (!Number.isFinite(milliseconds)) {
+            return;
+        }
+
+        let affordable = Math.floor(milliseconds * BURST_SHARE_OF_INTERVAL / BURST_GAP_MS);
+        this._burstReadings = Math.min(Math.max(affordable, MIN_BURST_READINGS), MAX_BURST_READINGS);
     }
 
     /**
-     * Stops the background poller. Idempotent, and safe to call off macOS.
+     * Nothing runs between samples, so there is nothing to shut down. Kept so
+     * callers need not know that.
      */
     public dispose() {
         this._disposed = true;
-        this.stopPolling();
     }
 
     /**
-     * Closes the interval: folds the update's own reading in with everything
-     * the poller gathered since the last update, then starts a fresh window.
+     * Takes one burst: a reading to re-base the statistic, then several spaced
+     * readings that are averaged.
+     *
+     * The first reading is discarded deliberately. It reports on the whole
+     * span since the previous update -- ten seconds, most of it idle -- which
+     * the statistic scores near 100%. Reading twice is what turns "since you
+     * last looked" into a window of known width.
      */
-    private summarise(reading: GpuReading | null): GpuStats | null {
+    private async burst(): Promise<GpuStats | null> {
+        let reading: GpuReading | null = await this.readRegistry();
         if (reading === null) {
-            // A failed read says nothing about the interval, so the readings
-            // already gathered are kept for the next update to report.
             return null;
         }
 
-        this.record(reading);
+        let window = new UtilizationWindow();
+        let idleReadings: number = 0;
 
-        // A window can close empty when the update interval is shorter than the
-        // poll cadence, so every reading in it measured the wrong span. The
-        // figure then holds rather than dropping to a zero nothing observed.
-        if (this._window.count > 0) {
-            this._smoothed = smoothUtilization(this._smoothed, this._window.mean, this._window.count);
+        for (let taken = 0; taken < this._burstReadings; taken++) {
+            await delay(BURST_GAP_MS);
+            let next: GpuReading | null = await this.readRegistry();
+            if (next === null) {
+                break;
+            }
+
+            reading = next;
+            window.add(next.utilization);
+
+            // An idle GPU has nothing further to report, so the rest of the
+            // burst would be spent confirming a zero.
+            idleReadings = next.utilization > 0 ? 0 : idleReadings + 1;
+            if (idleReadings >= IDLE_READINGS_BEFORE_STOPPING) {
+                break;
+            }
         }
 
-        let stats: GpuStats = {
-            utilization: this._smoothed === null ? reading.utilization : this._smoothed,
-            peakUtilization: this._window.peak,
-            sampleCount: this._window.count,
+        this._smoothed = smoothUtilization(
+            this._smoothed, window.count === 0 ? reading.utilization : window.mean);
+
+        return {
+            // The memory figures come from the burst's last reading, since they
+            // are levels rather than spans and want no averaging.
+            utilization: this._smoothed,
+            // The peak is this burst's own, not eased: it is there to show what
+            // an average hides, so smoothing it would defeat it.
+            peakUtilization: window.count === 0 ? reading.utilization : window.peak,
+            sampleCount: window.count,
             allocatedMemory: reading.allocatedMemory,
             mappedMemory: reading.mappedMemory,
             model: reading.model,
@@ -448,101 +418,6 @@ export class AppleGpuSampler {
             // rather than being given a meaningless one.
             totalMemory: reading.hasUnifiedMemory ? totalmem() : null,
         };
-
-        this._window.reset();
-        return stats;
-    }
-
-    /**
-     * Takes one reading into account: into the average if it measured the span
-     * it was meant to, and into the idle count either way.
-     *
-     * The gap test is what makes the average mean anything. "Device Utilization
-     * %" reports on the time since the previous read, so readings taken at
-     * different spacings are not comparable, and mixing them averages spans of
-     * different lengths as though they were alike. The reading that resumes
-     * polling after an idle back-off is the clearest case: it covers seconds of
-     * mostly-idle time and reads high, which would show up as a spike exactly
-     * when work begins.
-     */
-    private record(reading: GpuReading) {
-        let now: number = Date.now();
-        let gap: number = now - this._lastReadAt;
-        this._lastReadAt = now;
-
-        if (isComparableGap(gap, this._expectedGapMs)) {
-            this._window.add(reading.utilization);
-        }
-
-        // Tracked from every reading, not just the counted ones, so that work
-        // starting during a back-off is noticed at the first sight of it.
-        if (reading.utilization > 0) {
-            this._idleReadings = 0;
-        } else {
-            this._idleReadings++;
-        }
-    }
-
-    /**
-     * The delay before the next reading, relaxed while the GPU has nothing to
-     * report.
-     */
-    private nextDelay(): number {
-        if (this._idleReadings < IDLE_READINGS_BEFORE_BACKOFF) {
-            return this._pollIntervalMs;
-        }
-
-        // Never brisker than asked for, so a deliberately slow cadence is not
-        // quietly sped up by going idle.
-        return Math.max(this._pollIntervalMs, IDLE_POLL_INTERVAL_MS);
-    }
-
-    /**
-     * Begins taking readings between updates, if not already doing so.
-     *
-     * The timer is unreferenced: a status bar poller must never be the reason
-     * the extension host stays alive.
-     */
-    private startPolling() {
-        if (this._pollTimer !== null || this._disposed || process.platform !== 'darwin') {
-            return;
-        }
-
-        // Remembered so the next reading can be checked against the span it
-        // was supposed to measure.
-        this._expectedGapMs = this.nextDelay();
-        this._pollTimer = setTimeout(() => this.poll(), this._expectedGapMs);
-        this._pollTimer.unref();
-    }
-
-    private stopPolling() {
-        if (this._pollTimer !== null) {
-            clearTimeout(this._pollTimer);
-            this._pollTimer = null;
-        }
-    }
-
-    /**
-     * Takes one reading for the average, then schedules the next.
-     *
-     * Chained rather than an interval so a slow ioreg can never have two
-     * invocations in flight at once.
-     */
-    private poll() {
-        this._pollTimer = null;
-
-        // Nobody has asked for a sample in a long while, so the reading is
-        // hidden or switched off and the polling is pure waste.
-        if (this._disposed || Date.now() - this._lastRequestedAt > IDLE_TIMEOUT_MS) {
-            return;
-        }
-
-        this.readRegistry().then(reading => {
-            if (reading !== null) {
-                this.record(reading);
-            }
-            this.startPolling();
-        });
     }
 
     /**
@@ -567,4 +442,13 @@ export class AppleGpuSampler {
             });
         });
     }
+}
+
+function delay(milliseconds: number): Promise<void> {
+    return new Promise<void>(resolve => {
+        // Unreferenced so a burst in flight can never hold the extension host
+        // open at shutdown.
+        let timer = setTimeout(resolve, milliseconds);
+        timer.unref();
+    });
 }
