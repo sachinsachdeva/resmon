@@ -8,6 +8,12 @@ export interface Volume {
     mount: string;
     size: number;
     used: number;
+    /**
+     * Space genuinely still available, which on APFS is not size minus used:
+     * every volume in a container reports the container's size.
+     */
+    available: number;
+    /** Used as a percentage of used plus available, which is what df reports. */
     use: number;
 }
 

@@ -51,8 +51,9 @@ const DEFAULT_UPDATE_FREQUENCY_MS: number = 10000;
  * The processor's name and core count, read once.
  *
  * It cannot change while VS Code is running, and os.cpus() walks every core to
- * report it. systeminformation's si.cpu() would be the more natural source, but
- * 4.27 throws while parsing sysctl output on Apple Silicon.
+ * report it. systeminformation's si.cpu() would be the more natural source and
+ * no longer throws on Apple Silicon as 4.27 did, but it is asynchronous where
+ * this is read once at load.
  */
 const PROCESSOR: string = describeProcessor();
 
@@ -84,6 +85,28 @@ function loadAverage(): string | null {
         return null;
     }
     return averages.map(average => average.toFixed(2)).join(', ');
+}
+
+/**
+ * Whether a temperature reading is a reading at all.
+ *
+ * A machine with no sensor the OS will expose reports null, and releases
+ * before systeminformation 5 reported -1 for the same thing.
+ */
+function isReadableTemperature(celsius: number | null): boolean {
+    return typeof celsius === 'number' && Number.isFinite(celsius) && celsius > 0;
+}
+
+/**
+ * The space a volume actually has left.
+ *
+ * Not size minus used: on APFS every volume in a container reports the whole
+ * container as its size, so subtracting counts space the other volumes have
+ * already taken. The root volume of this machine has 245GB of "size", 13GB
+ * used and 10GB genuinely free.
+ */
+function freeSpace(volume: Volume): number {
+    return volume.available;
 }
 
 /**
@@ -198,7 +221,7 @@ class CpuUsage extends Resource {
 
     async render(): Promise<ResourceRender> {
         let currentLoad = await si.currentLoad();
-        let usage = 100 - currentLoad.currentload_idle;
+        let usage = 100 - currentLoad.currentLoadIdle;
 
         return {
             text: `$(pulse) ${usage.toFixed(this.getPrecision())}%`,
@@ -217,8 +240,8 @@ class CpuUsage extends Resource {
         // something, where 90% user time is work getting done.
         rows.push({
             label: "Usage",
-            value: `${this.formatPercent(usage)} (${this.formatPercent(currentLoad.currentload_user)} user, `
-                + `${this.formatPercent(currentLoad.currentload_system)} system)`,
+            value: `${this.formatPercent(usage)} (${this.formatPercent(currentLoad.currentLoadUser)} user, `
+                + `${this.formatPercent(currentLoad.currentLoadSystem)} system)`,
         });
 
         let cores = formatCoreLoads((currentLoad.cpus || []).map((cpu: any) => cpu.load));
@@ -242,7 +265,7 @@ class CpuFreq extends Resource {
     }
 
     async render(): Promise<ResourceRender> {
-        let cpuCurrentSpeed = await si.cpuCurrentspeed();
+        let cpuCurrentSpeed = await si.cpuCurrentSpeed();
         // systeminformation returns frequency in terms of GHz by default
         let speedHz = parseFloat(cpuCurrentSpeed.avg) * Units.G;
         let formattedWithUnits = this.getFormattedWithUnits(speedHz);
@@ -282,10 +305,12 @@ class CpuTemp extends Resource {
     }
 
     protected async isShown(): Promise<boolean> {
-        // If the CPU temp sensor cannot retrieve a valid temperature, disallow its reporting.
-        var cpuTemp = (await si.cpuTemperature()).main;
-        let hasCpuTemp = cpuTemp !== -1;
-        return hasCpuTemp && await super.isShown();
+        // A machine with no readable sensor reports null, and older releases
+        // reported -1, so the test is for a usable number rather than for
+        // either of the ways of saying there isn't one. Without this a Mac
+        // with no exposed sensor showed "null C".
+        let cpuTemp = (await si.cpuTemperature()).main;
+        return isReadableTemperature(cpuTemp) && await super.isShown();
     }
 
     async render(): Promise<ResourceRender> {
@@ -296,7 +321,7 @@ class CpuTemp extends Resource {
 
         // main is an average across packages on machines that have several, so
         // the hottest sensor is the one that throttles first.
-        if (currentTemps.max > currentTemps.main) {
+        if (isReadableTemperature(currentTemps.max) && currentTemps.max > currentTemps.main) {
             rows.push({ label: "Hottest sensor", value: this.formatCelsius(currentTemps.max) });
         }
 
@@ -405,7 +430,7 @@ class Battery extends Resource {
     }
 
     protected async isShown(): Promise<boolean> {
-        let hasBattery = (await si.battery()).hasbattery;
+        let hasBattery = (await si.battery()).hasBattery;
         return hasBattery && await super.isShown();
     }
 
@@ -425,30 +450,30 @@ class Battery extends Resource {
             { label: "State", value: this.getState(rawBattery) },
         ];
 
-        let remaining = formatMinutes(rawBattery.timeremaining);
+        let remaining = formatMinutes(rawBattery.timeRemaining);
         if (remaining !== null) {
-            rows.push({ label: rawBattery.ischarging ? "Until full" : "Remaining", value: remaining });
+            rows.push({ label: rawBattery.isCharging ? "Until full" : "Remaining", value: remaining });
         }
 
         // Batteries wear: a pack holding 4600 of the 5000 mAh it was built for
         // is at 92% health however full its charge reads.
-        if (rawBattery.designedcapacity > 0 && rawBattery.maxcapacity > 0) {
-            let health = rawBattery.maxcapacity / rawBattery.designedcapacity * 100;
+        if (rawBattery.designedCapacity > 0 && rawBattery.maxCapacity > 0) {
+            let health = rawBattery.maxCapacity / rawBattery.designedCapacity * 100;
             rows.push({ label: "Health", value: `${this.formatPercent(health)} of design capacity` });
         }
 
-        if (rawBattery.cyclecount > 0) {
-            rows.push({ label: "Cycles", value: `${rawBattery.cyclecount}` });
+        if (rawBattery.cycleCount > 0) {
+            rows.push({ label: "Cycles", value: `${rawBattery.cycleCount}` });
         }
 
         return rows;
     }
 
     private getState(rawBattery: any): string {
-        if (rawBattery.ischarging) {
+        if (rawBattery.isCharging) {
             return "Charging";
         }
-        if (rawBattery.acconnected) {
+        if (rawBattery.acConnected) {
             return "Plugged in, not charging";
         }
         return "On battery";
@@ -533,7 +558,7 @@ class DiskSpace extends Resource {
             case DiskSpaceFormat.PercentUsed:
                 return `${label} ${volume.use.toFixed(this.getPrecision())}% used`;
             case DiskSpaceFormat.Remaining:
-                return `${label} ${this.convertBytesToLargestUnit(volume.size - volume.used)} remaining`;
+                return `${label} ${this.convertBytesToLargestUnit(freeSpace(volume))} remaining`;
             case DiskSpaceFormat.UsedOutOfTotal:
                 return `${label} ${this.convertBytesToLargestUnit(volume.used)}/${this.convertBytesToLargestUnit(volume.size)} used`;
         }
@@ -559,7 +584,7 @@ class DiskSpace extends Resource {
         return {
             label: volumeLabel(volume, process.platform),
             value: `${this.convertBytesToLargestUnit(volume.used)} of ${this.convertBytesToLargestUnit(volume.size)} used`
-                + ` (${this.formatPercent(volume.use)}), ${this.convertBytesToLargestUnit(volume.size - volume.used)} free`,
+                + ` (${this.formatPercent(volume.use)}), ${this.convertBytesToLargestUnit(freeSpace(volume))} free`,
         };
     }
 }

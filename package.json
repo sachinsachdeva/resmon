@@ -211,7 +211,7 @@
         "watch": "tsc -watch -p ./"
     },
     "dependencies": {
-        "systeminformation": "^4.27.11"
+        "systeminformation": "^5.33.6"
     },
     "devDependencies": {
         "@types/node": "^20.19.43",
