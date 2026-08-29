@@ -271,7 +271,7 @@ test('the first reading of all has no span to measure', () => {
 test('the reading that resumes polling after an idle spell is not counted', () => {
     // It spans seconds of mostly-idle time, and the statistic discounts idle
     // time, so counting it would spike the figure exactly when work begins.
-    let idleCadence = 250 * 4;
+    let idleCadence = 2000;
 
     assert.strictEqual(isComparableGap(idleCadence, 250), false,
         'a reading arriving on the relaxed cadence cannot join a brisk average');
