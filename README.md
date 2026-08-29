@@ -106,7 +106,18 @@ GPU statistics are **macOS only**, and work on Apple Silicon (M-series) as well 
   | 300 ms | 80% |
   | 500 ms | 93% |
 
-  So the reading is sampled in the background and averaged, rather than read once per update. `systemvitals.gpu.sampleintervalms` is that cadence, and it is a direct trade of CPU for accuracy: each read costs about 9 ms of CPU, so the 250 ms default spends roughly 3.5% of one core while the reading is on screen. Lower it for a more faithful percentage on bursty workloads, raise it to spend less. Polling relaxes automatically while the GPU is idle, and stops entirely when the reading is hidden or switched off. A steady load and an idle GPU are reported accurately at any cadence; only intermittent work is sensitive to it.
+  So the reading is sampled in the background and averaged, rather than read once per update. `systemvitals.gpu.sampleintervalms` is that cadence, and it is a direct trade of CPU for accuracy. A read costs about 28 ms of CPU when made periodically — considerably more than the 9 ms it costs back to back, because a spawn this far apart re-faults and re-links rather than running warm:
+
+  | Cadence | Reports | CPU while busy |
+  |:---|:---|:---|
+  | 100 ms | 60% | ~22% of one core |
+  | 250 ms (default) | 78% | ~10% of one core |
+  | 500 ms | ~93% | ~5.5% of one core |
+  | 1000 ms | ~96% | ~3.3% of one core |
+
+  The accuracy cliff is steep and sits just below the default: at 500 ms and slower every cadence reports 87–96% for that load, which is no better than not averaging at all. Lower the setting for a more faithful percentage, raise it to spend less and accept a figure that runs high.
+
+  That cost is only paid while the GPU is working. After eight idle readings the poller drops to every 2 s — a measured 2% of one core — because an idle GPU reads zero however often it is asked, and it stops entirely when the reading is hidden or switched off. A steady load and an idle GPU are reported accurately at any cadence; only intermittent work is sensitive to it.
 
 - `systemvitals.show.gpumem` displays GPU memory as *in use / total*. On Apple Silicon this is the driver's `Alloc system memory` — the memory the GPU has actually claimed, which tracks real allocations exactly — against total system memory. It is **not** used-out-of-VRAM: unified memory means there is no fixed GPU partition, so the total is the shared pool the GPU draws from rather than a dedicated capacity. On a Mac with a discrete GPU, whose VRAM the registry does not report, the allocation is shown on its own with no total. The hover additionally reports "Mapped now" (`In use system memory`), which counts only what is mapped at that instant and moves independently of what the GPU has allocated.
 

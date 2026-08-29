@@ -82,13 +82,19 @@ const CACHE_WINDOW_MS: number = 100;
 
 // How often the background poller reads utilization between updates.
 //
-// This is the accuracy dial, and it is spent in CPU: an ioreg invocation costs
-// about 9ms however little is asked of it, which is dear next to the syscall
-// behind the CPU percentage. Four reads a second spends roughly 3.5% of one
-// core while the reading is on screen, and is close enough for a load that is
-// steady or absent, which is nearly all of them. The interval is deliberately
-// fixed rather than jittered: the statistic measures the span between reads,
-// so an irregular cadence measures an irregular thing.
+// This is the accuracy dial, and it is spent in CPU. An ioreg invocation costs
+// about 28ms of CPU when made periodically -- far more than the 9ms it costs
+// back to back, because a spawn this far apart re-faults and re-links rather
+// than running warm -- which is dear next to the syscall behind the CPU
+// percentage. Four reads a second therefore spends around 10% of one core
+// while the GPU is busy, and the idle back-off is what keeps that off the bill
+// the rest of the time.
+//
+// The accuracy cliff is steep and sits just below here: at 500ms and slower
+// every cadence reports 87-96% for a load that is truly 47%, which is no better
+// than reading once per update. The interval is deliberately fixed rather than
+// jittered, since the statistic measures the span between reads and an
+// irregular cadence measures an irregular thing.
 const DEFAULT_POLL_INTERVAL_MS: number = 250;
 
 // Below this the readings cost more than they inform; above it the figure drifts
@@ -104,12 +110,13 @@ const MAX_POLL_INTERVAL_MS: number = 2000;
 const GAP_TOLERANCE_LOW: number = 0.5;
 const GAP_TOLERANCE_HIGH: number = 2;
 
-// An idle GPU reads zero at any cadence, so once this many readings in a row
-// come back idle the poller slows down by this factor. Nearly all of a working
-// day is idle as far as the GPU is concerned, which is what makes a brisk
-// cadence affordable during the parts that are not.
+// An idle GPU reads zero however often it is asked, so once this many readings
+// in a row come back idle the poller drops to a cadence chosen purely for cost.
+// Nearly all of a working day is idle as far as the GPU is concerned, so this
+// is what the reading costs most of the time: a measured 2% of one core, against
+// the 10% a brisk cadence spends while there is actually something to measure.
 const IDLE_READINGS_BEFORE_BACKOFF: number = 8;
-const IDLE_BACKOFF_FACTOR: number = 4;
+const IDLE_POLL_INTERVAL_MS: number = 2000;
 
 // How many readings a window must hold before its mean is taken at face value.
 //
@@ -485,7 +492,9 @@ export class AppleGpuSampler {
             return this._pollIntervalMs;
         }
 
-        return Math.min(this._pollIntervalMs * IDLE_BACKOFF_FACTOR, MAX_POLL_INTERVAL_MS);
+        // Never brisker than asked for, so a deliberately slow cadence is not
+        // quietly sped up by going idle.
+        return Math.max(this._pollIntervalMs, IDLE_POLL_INTERVAL_MS);
     }
 
     /**
