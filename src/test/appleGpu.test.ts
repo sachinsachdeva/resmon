@@ -1,5 +1,8 @@
 import * as assert from 'assert';
 import { test } from 'node:test';
+import * as childProcess from 'child_process';
+import { execFile } from 'child_process';
+import * as path from 'path';
 import { parsePerformanceStatistics, AppleGpuSampler, UtilizationWindow, smoothUtilization } from '../appleGpu';
 
 // Trimmed from real `ioreg -r -d 1 -w 0 -c IOAccelerator` output on an Apple M4.
@@ -250,21 +253,46 @@ test('a disposed sampler goes quiet', async () => {
     assert.strictEqual(await sampler.sample(), null);
 });
 
-test('a sampler takes a burst per sample, and nothing between them', async () => {
-    // The reason this design exists: every VS Code window runs its own
-    // extension host, so anything running between updates multiplies by the
-    // number of open windows.
+test('a sample resolves even when nothing else keeps the event loop alive', async () => {
+    // Run in a child, because the rest of this suite keeps the loop busy and
+    // would mask the fault. An unreferenced timer inside the burst lets the
+    // loop drain, so the burst never resolves -- and ResMon.update() awaits
+    // every resource together, so that hangs the whole status bar rather than
+    // just the GPU reading.
+    let sampler = path.join(__dirname, '..', 'appleGpu.js');
+    let script = `const {AppleGpuSampler}=require(${JSON.stringify(sampler)});`
+        + `new AppleGpuSampler().sample().then(()=>console.log('resolved'));`;
+
+    let printed = await new Promise<string>(resolve => {
+        execFile(process.execPath, ['-e', script], { timeout: 20000 }, (error, stdout) => {
+            resolve(error ? '' : stdout.toString().trim());
+        });
+    });
+
+    assert.strictEqual(printed, 'resolved', 'the burst was abandoned when the loop drained');
+});
+
+test('nothing reads the registry between samples', async () => {
+    // The reason bursts replaced a background poller: every VS Code window runs
+    // its own extension host, so anything running between updates multiplies by
+    // the number of open windows.
     let sampler = new AppleGpuSampler();
     await sampler.sample();
 
-    let quiet = await new Promise<boolean>(resolve => {
-        let readsAfterSampling = 0;
-        let handle = setInterval(() => { readsAfterSampling++; }, 50);
-        handle.unref();
-        setTimeout(() => { clearInterval(handle); resolve(true); }, 300).unref();
-    });
+    let readsBetween = 0;
+    let watched = childProcess.execFile;
+    (childProcess as any).execFile = (...args: any[]) => {
+        readsBetween++;
+        return (watched as any).apply(childProcess, args);
+    };
 
-    assert.ok(quiet, 'nothing should be scheduled between samples');
+    try {
+        await new Promise<void>(resolve => { setTimeout(resolve, 600); });
+    } finally {
+        (childProcess as any).execFile = watched;
+    }
+
+    assert.strictEqual(readsBetween, 0, `${readsBetween} registry reads happened between samples`);
     sampler.dispose();
 });
 
