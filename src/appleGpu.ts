@@ -380,6 +380,10 @@ export class AppleGpuSampler {
 
         for (let taken = 0; taken < this._burstReadings; taken++) {
             await delay(BURST_GAP_MS);
+            if (this._disposed) {
+                break;
+            }
+
             let next: GpuReading | null = await this.readRegistry();
             if (next === null) {
                 break;
@@ -445,10 +449,11 @@ export class AppleGpuSampler {
 }
 
 function delay(milliseconds: number): Promise<void> {
-    return new Promise<void>(resolve => {
-        // Unreferenced so a burst in flight can never hold the extension host
-        // open at shutdown.
-        let timer = setTimeout(resolve, milliseconds);
-        timer.unref();
-    });
+    // Deliberately referenced. An unreferenced timer here lets the event loop
+    // drain mid-burst when nothing else is pending, so the burst never resolves
+    // -- and since ResMon.update() awaits every resource together, that would
+    // hang the whole status bar rather than just the GPU reading. A burst is a
+    // few hundred milliseconds at most, so it cannot hold shutdown up for long,
+    // and dispose() stops it at the next gap regardless.
+    return new Promise<void>(resolve => { setTimeout(resolve, milliseconds); });
 }
